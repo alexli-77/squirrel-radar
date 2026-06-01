@@ -7,6 +7,8 @@ AI 客户端模块
 """
 
 import os
+import subprocess
+from pathlib import Path
 from typing import Any, Dict, List
 
 from litellm import completion
@@ -38,6 +40,67 @@ class AIClient:
         self.timeout = config.get("TIMEOUT", 120)
         self.num_retries = config.get("NUM_RETRIES", 2)
         self.fallback_models = config.get("FALLBACK_MODELS", [])
+        self.local_command = config.get("LOCAL_COMMAND") or os.environ.get("AI_LOCAL_COMMAND", "claude")
+
+    def _is_local_claude_cli(self) -> bool:
+        return self.model == "local/claude-cli"
+
+    def has_auth(self) -> bool:
+        return bool(self.api_key) or self._is_local_claude_cli()
+
+    def _chat_with_claude_cli(self, messages: List[Dict[str, str]]) -> str:
+        system_parts = []
+        user_parts = []
+
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                system_parts.append(content)
+            else:
+                user_parts.append(f"[{role}]\n{content}")
+
+        cmd = [self.local_command, "--print"]
+        system_prompt = "\n\n".join(part for part in system_parts if part).strip()
+        if system_prompt:
+            cmd.extend(["--append-system-prompt", system_prompt])
+
+        user_prompt = "\n\n".join(part for part in user_parts if part).strip()
+        if not user_prompt:
+            user_prompt = "请根据 system prompt 完成任务。"
+
+        env = os.environ.copy()
+        if not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            token_file = Path.home() / ".openclaw" / "secrets" / "claude-code.env"
+            if token_file.exists():
+                for raw in token_file.read_text(encoding="utf-8").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    env.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=user_prompt,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                check=False,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"未找到本地 Claude CLI: {self.local_command}。请安装/登录 Claude Code，"
+                "或设置 AI_LOCAL_COMMAND 指向 claude 可执行文件。"
+            ) from exc
+
+        if result.returncode != 0:
+            error = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"Claude CLI 调用失败({result.returncode}): {error[:1000]}")
+
+        return result.stdout.strip()
 
     def chat(
         self,
@@ -57,6 +120,9 @@ class AIClient:
         Raises:
             Exception: API 调用失败时抛出异常
         """
+        if self._is_local_claude_cli():
+            return self._chat_with_claude_cli(messages)
+
         # 构建请求参数
         params = {
             "model": self.model,
@@ -111,7 +177,7 @@ class AIClient:
         if not self.model:
             return False, "未配置 AI 模型（model）"
 
-        if not self.api_key:
+        if not self.api_key and not self._is_local_claude_cli():
             return False, "未配置 AI API Key，请在 config.yaml 或环境变量 AI_API_KEY 中设置"
 
         # 验证模型格式（应该包含 provider/model）
